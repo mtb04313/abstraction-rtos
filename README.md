@@ -21,6 +21,7 @@ To use the RTOS Abstraction, simply include a reference to `cyabs_rtos.h` and up
 * COMPONENTS+=RTX
 * COMPONENTS+=FREERTOS
 * COMPONENTS+=THREADX
+* COMPONENTS+=RTTHREAD
 
 ## Features
 
@@ -35,6 +36,7 @@ To use the RTOS Abstraction, simply include a reference to `cyabs_rtos.h` and up
     * FreeRTOS
     * RTX (CMSIS RTOS)
     * ThreadX
+    * RT-Thread
 
 ## RTOS Configuration Requirements
 ### FreeRTOS
