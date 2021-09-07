@@ -389,6 +389,38 @@ cy_rslt_t cy_rtos_get_thread_handle(cy_thread_t *thread)
     return CY_RSLT_SUCCESS;
 }
 
+cy_rslt_t cy_rtos_wait_thread_notification(cy_time_t num_ms)
+{
+    rt_err_t result;
+
+    // make num_ms < (RT_TICK_MAX / 2) to keep rt-thread happy
+    if (num_ms >= (RT_TICK_MAX / 2)) {
+        num_ms = RT_TICK_MAX / 2 - 1;
+    }
+
+    result = rt_thread_mdelay(num_ms);
+
+    return (result == RT_EOK)
+        ? CY_RSLT_SUCCESS : CY_RTOS_TIMEOUT;
+}
+
+cy_rslt_t cy_rtos_set_thread_notification(cy_thread_t* thread, bool in_isr)
+{
+    cy_task_wrapper_t *wrapper_ptr;
+    (void)in_isr;   // unused
+
+    RT_ReturnAssert(thread != NULL, CY_RTOS_BAD_PARAM);
+
+    wrapper_ptr = (cy_task_wrapper_t *) (*thread);
+    RT_ReturnAssert(wrapper_ptr != NULL, CY_RTOS_BAD_PARAM);
+    RT_ReturnAssert(wrapper_ptr->magic == TASK_IDENT, CY_RTOS_BAD_PARAM);
+
+    /* rt_err_t result = */ rt_thread_resume(wrapper_ptr->thread);
+    //return (result == RT_EOK)
+    //    ? CY_RSLT_SUCCESS : CY_RTOS_GENERAL_ERROR;
+    return CY_RSLT_SUCCESS;
+}
+
 /******************************************************
 *                 Mutexes
 *
@@ -884,8 +916,6 @@ cy_rslt_t cy_rtos_get_semaphore(cy_semaphore_t * semaphore,
         cy_time_t ticks = convert_ms_to_ticks(timeout_ms);
         result = rt_sem_take(wrapper_ptr->sem, ticks);
     }
-
-    RT_ReturnAssert((result == RT_EOK), CY_RTOS_GENERAL_ERROR);
 
     return (result == RT_EOK)
         ? CY_RSLT_SUCCESS : CY_RTOS_TIMEOUT;

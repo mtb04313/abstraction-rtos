@@ -67,7 +67,7 @@ typedef void* cy_event_t;              /**< Alias for the RTOS specific definiti
 typedef void* cy_queue_t;              /**< Alias for the RTOS specific definition of a message queue */
 typedef void* cy_timer_t;              /**< Alias for the RTOS specific definition of a timer */
 typedef void* cy_timer_callback_arg_t; /**< Alias for the RTOS specific argument passed to the timer callback function */
-typedef rt_tick_t cy_time_t;           /**< Alias for the RTOS specific time unit (in milliseconds) */
+typedef uint32_t cy_time_t;            /**< Alias for the RTOS specific time unit (in milliseconds) */
 typedef rt_err_t cy_rtos_error_t;      /**< Alias for the RTOS specific definition of a error status */
 
 
