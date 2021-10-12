@@ -33,6 +33,12 @@
 
 /*-- Local Definitions -------------------------------------------------*/
 
+#define USE_CY_MEMTRACK                                   0    // 1:enable; 0:disable
+
+#if USE_CY_MEMTRACK
+#include "cy_memtrack.h"
+#endif
+
 #define IMPLEMENT_CY_MUTEX_USING_RT_SEMAPHORE_RECURSIVE   1    // 1:enable; 0:disable
 #define IMPLEMENT_CY_MUTEX_USING_RT_MUTEX_AND_SEMAPHORE   0    // 1:enable; 0:disable
 
@@ -73,7 +79,7 @@ static const uint32_t SEMAPHORE_IDENT = 0xDBCDEF01;
 static const uint32_t EVENT_IDENT     = 0xEBCDEF01;
 static const uint32_t TIMER_IDENT     = 0xFBCDEF01;
 
-static cy_rtos_error_t last_error;
+static cy_rtos_error_t s_last_error = RT_EOK;
 
 #if (USE_CY_DEBUG)
 #include "cy_debug.h"
@@ -97,30 +103,31 @@ static inline cy_time_t convert_ticks_to_ms(cy_time_t timeout_ticks)
 static inline cy_rslt_t convert_error(cy_rtos_error_t error)
 {
     if (error != RT_EOK) {
-        last_error = error;
+        s_last_error = error;
         return CY_RTOS_GENERAL_ERROR;
     }
     return CY_RSLT_SUCCESS;
 }
 #endif
 
-
-static char *make_name_field(size_t len,
-                             char prefix)
+static void make_name_field( char *name_p,
+                             size_t bufsize,
+                             char prefix,
+                             uint16_t *counter_p)
 {
-    if (len >= 10) {
-        char *name_p = (char *) malloc(len);
-        if (name_p != NULL) {
-            snprintf(name_p, len, "%c%08lX", prefix, (uint32_t) name_p);
-            return name_p;
-        }
-    }
-    return NULL;
+    RT_VoidAssert(name_p != NULL);
+    RT_VoidAssert(counter_p != NULL);
+
+    rt_enter_critical();
+
+    snprintf(name_p, bufsize, "%c%d", prefix, *counter_p);
+    *counter_p += 1;
+
+    rt_exit_critical();
 }
 
 
 /*-- Public Functions -------------------------------------------------*/
-
 
 /******************************************************
 *                 Last Error
@@ -128,7 +135,7 @@ static char *make_name_field(size_t len,
 
 cy_rtos_error_t cy_rtos_last_error(void)
 {
-    return last_error;
+    return s_last_error;
 }
 
 /******************************************************
@@ -156,6 +163,7 @@ cy_rslt_t cy_rtos_create_thread(cy_thread_t *thread,
     cy_task_wrapper_t *wrapper_ptr;
 
     RT_ReturnAssert(thread != NULL, CY_RTOS_BAD_PARAM);
+    RT_ReturnAssert(name != NULL, CY_RTOS_BAD_PARAM);
 
     stack_size &= ~CY_RTOS_ALIGNMENT_MASK;      // make stack pointer 8-byte aligned
     RT_ReturnAssert(stack_size >= CY_RTOS_MIN_STACK_SIZE, CY_RTOS_BAD_PARAM);
@@ -170,7 +178,12 @@ cy_rslt_t cy_rtos_create_thread(cy_thread_t *thread,
         malloc_size += stack_size;
     }
 
+#if USE_CY_MEMTRACK
+    buffer = CY_MEMTRACK_MALLOC(malloc_size);
+#else
     buffer = malloc(malloc_size);
+#endif
+
     RT_ReturnAssert(buffer != NULL, CY_RTOS_NO_MEMORY);
     memset(buffer, 0, malloc_size);
 
@@ -188,13 +201,21 @@ cy_rslt_t cy_rtos_create_thread(cy_thread_t *thread,
 
     do {
         cy_rslt_t status;
+        char temp_name[RT_NAME_MAX];
 
-        status = cy_rtos_init_semaphore(&wrapper_ptr->sem, 1, 1);
+        // truncate name if needed
+        snprintf(temp_name, sizeof(temp_name), "%s", name);
+
+#if (USE_CY_DEBUG)
+        CY_LOGD(TAG, "name = %s, temp_name = %s, RT_NAME_MAX = %d", name, temp_name, RT_NAME_MAX);
+#endif
+
+        status = cy_rtos_init_semaphore(&wrapper_ptr->sem, 1, 0);
         if (status != CY_RSLT_SUCCESS) {
             break;
         }
 
-        wrapper_ptr->thread = rt_thread_create(name,
+        wrapper_ptr->thread = rt_thread_create(temp_name, //name,
                                                entry_function,
                                                arg,
                                                stack_size,
@@ -206,8 +227,8 @@ cy_rslt_t cy_rtos_create_thread(cy_thread_t *thread,
         }
 
 #if (USE_CY_DEBUG)
-        CY_LOGD(TAG, "%s [%d]: name = %s, stack_size = %d, priority = %d",
-                 __FUNCTION__, __LINE__, name, stack_size, priority);
+        CY_LOGD(TAG, "%s [%d]: name = %s, stack_size = %d, priority = %d, rt_thread_t = %p, wrapper_ptr = %p",
+                 __FUNCTION__, __LINE__, temp_name, stack_size, priority, wrapper_ptr->thread, wrapper_ptr);
 #endif
 
         wrapper_ptr->thread->user_data = (rt_ubase_t) wrapper_ptr;
@@ -224,8 +245,13 @@ cy_rslt_t cy_rtos_create_thread(cy_thread_t *thread,
         cy_rtos_deinit_semaphore(&wrapper_ptr->sem);
     }
 
+#if USE_CY_MEMTRACK
+    CY_MEMTRACK_FREE(buffer);
+#else
     free(buffer);
-    last_error = RT_ENOMEM;
+#endif
+
+    s_last_error = RT_ENOMEM;
     return CY_RTOS_NO_MEMORY;
 }
 
@@ -249,17 +275,25 @@ cy_rslt_t cy_rtos_exit_thread(void)
     RT_ReturnAssert(wrapper_ptr != NULL, CY_RTOS_GENERAL_ERROR);
     RT_ReturnAssert(wrapper_ptr->magic == TASK_IDENT, CY_RTOS_GENERAL_ERROR);
 
+#if USE_CY_DEBUG
+    DEBUG_PRINT(("%s [%d] set_semaphore\n", __FUNCTION__, __LINE__));
+#endif
+
     /* This signals to the thread deleting the current thread that it
      * it is safe to delete the current thread.
      */
     cy_rtos_set_semaphore(&wrapper_ptr->sem, false);
 
+    /* RT-thread rt_thread_exit() will be automatically invoked when
+     * the task function returns.  So we don't need to do anything
+     * here, just let the function returns.
+     */
+
     /* This function is not expected to return and calling cy_rtos_join_thread
      * will call rt_thread_delete on this thread and clean up.
      */
-    while (1) {
-        rt_thread_suspend(wrapper_ptr->thread);
-    }
+    //rt_thread_suspend(wrapper_ptr->thread);
+    //while (true);
 
     return CY_RSLT_SUCCESS;
 }
@@ -274,14 +308,29 @@ cy_rslt_t cy_rtos_terminate_thread(cy_thread_t * thread)
     RT_ReturnAssert(wrapper_ptr != NULL, CY_RTOS_BAD_PARAM);
     RT_ReturnAssert(wrapper_ptr->magic == TASK_IDENT, CY_RTOS_BAD_PARAM);
 
-    rt_thread_delete(wrapper_ptr->thread);
+    if (rt_object_get_type((rt_object_t)wrapper_ptr->thread) == RT_Object_Class_Thread) {
+#if USE_CY_DEBUG
+        DEBUG_PRINT(("%s [%d] call rt_thread_delete\n", __FUNCTION__, __LINE__));
+#endif
+        rt_thread_delete(wrapper_ptr->thread);
+
+    } else {
+#if USE_CY_DEBUG
+        DEBUG_PRINT(("%s [%d] rt_thread_delete already called\n", __FUNCTION__, __LINE__));
+#endif
+    }
 
     rt_enter_critical();
 
     wrapper_ptr->thread = NULL;
     wrapper_ptr->magic = 0;
     cy_rtos_deinit_semaphore(&wrapper_ptr->sem);
+
+#if USE_CY_MEMTRACK
+    CY_MEMTRACK_FREE(wrapper_ptr->memptr);
+#else
     free(wrapper_ptr->memptr);
+#endif
 
     rt_exit_critical();
 
@@ -331,18 +380,23 @@ cy_rslt_t cy_rtos_get_thread_state(cy_thread_t *thread,
     case RT_THREAD_INIT:
         *state = CY_THREAD_STATE_INACTIVE;
         break;
+
     case RT_THREAD_READY:
         *state = CY_THREAD_STATE_READY;
         break;
+
     case RT_THREAD_RUNNING:
         *state = CY_THREAD_STATE_RUNNING;
         break;
+
     case RT_THREAD_SUSPEND:    /* same as RT_THREAD_BLOCK */
         *state = CY_THREAD_STATE_BLOCKED;
         break;
+
     case RT_THREAD_CLOSE:
         *state = CY_THREAD_STATE_TERMINATED;
         break;
+
     default:
         *state = CY_THREAD_STATE_UNKNOWN;
         break;
@@ -354,18 +408,34 @@ cy_rslt_t cy_rtos_get_thread_state(cy_thread_t *thread,
 cy_rslt_t cy_rtos_join_thread(cy_thread_t *thread)
 {
     cy_task_wrapper_t *wrapper_ptr;
-    cy_rslt_t status;
+    cy_rslt_t status = CY_RSLT_SUCCESS;
 
     RT_ReturnAssert(thread != NULL, CY_RTOS_BAD_PARAM);
 
     wrapper_ptr = (cy_task_wrapper_t *) (*thread);
     RT_ReturnAssert(wrapper_ptr != NULL, CY_RTOS_BAD_PARAM);
-    RT_ReturnAssert(wrapper_ptr->magic == TASK_IDENT, CY_RTOS_BAD_PARAM);
 
-    status = cy_rtos_get_semaphore(&wrapper_ptr->sem, CY_RTOS_NEVER_TIMEOUT, false);
-    if (status == CY_RSLT_SUCCESS) {
-        status = cy_rtos_terminate_thread(thread);
-        *thread = NULL;
+    // This makes sure that the thread to be deleted has completed.  See cy_rtos_exit_thread()
+    // for description of why this is done.
+    if (wrapper_ptr->magic == TASK_IDENT) {
+#if USE_CY_DEBUG
+        DEBUG_PRINT(("%s [%d] get_semaphore\n", __FUNCTION__, __LINE__));
+#endif
+
+        status = cy_rtos_get_semaphore(&wrapper_ptr->sem, CY_RTOS_NEVER_TIMEOUT, false);
+        if (status == CY_RSLT_SUCCESS) {
+#if USE_CY_DEBUG
+            DEBUG_PRINT(("%s [%d] got_semaphore, call cy_rtos_terminate_thread\n", __FUNCTION__, __LINE__));
+#endif
+
+            status = cy_rtos_terminate_thread(thread);
+            *thread = NULL;
+        }
+
+    } else {
+#if USE_CY_DEBUG
+        DEBUG_PRINT(("%s [%d] cy_rtos_terminate_thread already called\n", __FUNCTION__, __LINE__));
+#endif
     }
 
     return status;
@@ -399,6 +469,7 @@ cy_rslt_t cy_rtos_wait_thread_notification(cy_time_t num_ms)
     }
 
     result = rt_thread_mdelay(num_ms);
+    s_last_error = result;
 
     return (result == RT_EOK)
         ? CY_RSLT_SUCCESS : CY_RTOS_TIMEOUT;
@@ -406,6 +477,7 @@ cy_rslt_t cy_rtos_wait_thread_notification(cy_time_t num_ms)
 
 cy_rslt_t cy_rtos_set_thread_notification(cy_thread_t* thread, bool in_isr)
 {
+    rt_err_t result;
     cy_task_wrapper_t *wrapper_ptr;
     (void)in_isr;   // unused
 
@@ -415,9 +487,9 @@ cy_rslt_t cy_rtos_set_thread_notification(cy_thread_t* thread, bool in_isr)
     RT_ReturnAssert(wrapper_ptr != NULL, CY_RTOS_BAD_PARAM);
     RT_ReturnAssert(wrapper_ptr->magic == TASK_IDENT, CY_RTOS_BAD_PARAM);
 
-    /* rt_err_t result = */ rt_thread_resume(wrapper_ptr->thread);
-    //return (result == RT_EOK)
-    //    ? CY_RSLT_SUCCESS : CY_RTOS_GENERAL_ERROR;
+    result = rt_thread_resume(wrapper_ptr->thread);
+    s_last_error = result;
+
     return CY_RSLT_SUCCESS;
 }
 
@@ -448,12 +520,10 @@ cy_rslt_t cy_rtos_set_thread_notification(cy_thread_t* thread, bool in_isr)
 
 #if (IMPLEMENT_CY_MUTEX_USING_RT_MUTEX_AND_SEMAPHORE)
 #define MUTEX_NAME_PREFIX_CHAR  'm'
-#define MUTEX_NAME_MAX_LEN      10      /* e.g. "mDEADBEEF" with null terminator */
 
 typedef struct {
     rt_mutex_t mutex;
     uint32_t magic;
-    char *name_p;
 } cy_mutex_wrapper_t;
 
 
@@ -466,17 +536,26 @@ static cy_rslt_t internal_rtos_init_mutex(cy_mutex_wrapper_t **mutex,
     (void) recursive;           // unused parameter
 
     do {
+        static uint16_t counter = 0;
+        char name[RT_NAME_MAX];
+
+#if USE_CY_MEMTRACK
+        wrapper_ptr = (cy_mutex_wrapper_t *) CY_MEMTRACK_MALLOC(sizeof(cy_mutex_wrapper_t));
+#else
         wrapper_ptr = (cy_mutex_wrapper_t *) malloc(sizeof(cy_mutex_wrapper_t));
+#endif
+
         RT_ReturnAssert(wrapper_ptr != NULL, CY_RTOS_NO_MEMORY);
 
         wrapper_ptr->magic = MUTEX_IDENT;
-        wrapper_ptr->name_p = make_name_field(MUTEX_NAME_MAX_LEN,
-                                              MUTEX_NAME_PREFIX_CHAR);
-        if (wrapper_ptr->name_p == NULL) {
-            break;
-        }
 
-        wrapper_ptr->mutex = rt_mutex_create(wrapper_ptr->name_p, RT_IPC_FLAG_FIFO);
+        make_name_field(name,
+                        sizeof(name),
+                        MUTEX_NAME_PREFIX_CHAR,
+                        &counter);
+
+        wrapper_ptr->mutex = rt_mutex_create(name,
+                                             RT_IPC_FLAG_FIFO);
         if (wrapper_ptr->mutex == NULL) {
             break;
         }
@@ -486,11 +565,11 @@ static cy_rslt_t internal_rtos_init_mutex(cy_mutex_wrapper_t **mutex,
 
     } while (0);
 
-    /* clean up on failure */
-    if (wrapper_ptr != NULL) {
-        free(wrapper_ptr->name_p);
-    }
+#if USE_CY_MEMTRACK
+    CY_MEMTRACK_FREE(wrapper_ptr);
+#else
     free(wrapper_ptr);
+#endif
 
     return CY_RTOS_NO_MEMORY;
 }
@@ -510,6 +589,7 @@ static cy_rslt_t internal_rtos_get_mutex(cy_mutex_wrapper_t ** mutex,
 
     ticks = convert_ms_to_ticks(timeout_ms);
     result = rt_mutex_take(wrapper_ptr->mutex, ticks);
+    s_last_error = result;
 
     return (result == RT_EOK)
         ? CY_RSLT_SUCCESS : CY_RTOS_TIMEOUT;
@@ -527,6 +607,7 @@ static cy_rslt_t internal_rtos_set_mutex(cy_mutex_wrapper_t **mutex)
     RT_ReturnAssert(wrapper_ptr->magic == MUTEX_IDENT, CY_RTOS_BAD_PARAM);
 
     result = rt_mutex_release(wrapper_ptr->mutex);
+    s_last_error = result;
 
     return (result == RT_EOK)
         ? CY_RSLT_SUCCESS : CY_RTOS_TIMEOUT;
@@ -546,9 +627,13 @@ static cy_rslt_t internal_rtos_deinit_mutex(cy_mutex_wrapper_t **mutex)
     rt_enter_critical();
 
     result = rt_mutex_delete(wrapper_ptr->mutex);
+    s_last_error = result;
 
-    free(wrapper_ptr->name_p);
+#if USE_CY_MEMTRACK
+    CY_MEMTRACK_FREE(wrapper_ptr);
+#else
     free(wrapper_ptr);
+#endif
 
     rt_exit_critical();
 
@@ -587,7 +672,13 @@ cy_rslt_t cy_rtos_init_mutex2(cy_mutex_t * mutex,
 
     do {
         cy_rslt_t status;
+
+#if USE_CY_MEMTRACK
+        wrapper_ptr = (cy_mutex2_wrapper_t *) CY_MEMTRACK_MALLOC(sizeof(cy_mutex2_wrapper_t));
+#else
         wrapper_ptr = (cy_mutex2_wrapper_t *) malloc(sizeof(cy_mutex2_wrapper_t));
+#endif
+
         RT_ReturnAssert(wrapper_ptr != NULL, CY_RTOS_NO_MEMORY);
 
         memset(wrapper_ptr, 0, sizeof(cy_mutex2_wrapper_t));
@@ -611,7 +702,11 @@ cy_rslt_t cy_rtos_init_mutex2(cy_mutex_t * mutex,
     } while (0);
 
     /* clean up on failure */
+#if USE_CY_MEMTRACK
+    CY_MEMTRACK_FREE(wrapper_ptr);
+#else
     free(wrapper_ptr);
+#endif
 
     return CY_RTOS_NO_MEMORY;
 
@@ -622,7 +717,13 @@ cy_rslt_t cy_rtos_init_mutex2(cy_mutex_t * mutex,
 
     do {
         cy_rslt_t status;
+
+#if USE_CY_MEMTRACK
+        wrapper_ptr = (cy_mutex3_wrapper_t *) CY_MEMTRACK_MALLOC(sizeof(*wrapper_ptr));
+#else
         wrapper_ptr = (cy_mutex3_wrapper_t *) malloc(sizeof(*wrapper_ptr));
+#endif
+
         RT_ReturnAssert(wrapper_ptr != NULL, CY_RTOS_NO_MEMORY);
 
         memset(wrapper_ptr, 0, sizeof(*wrapper_ptr));
@@ -642,7 +743,11 @@ cy_rslt_t cy_rtos_init_mutex2(cy_mutex_t * mutex,
     } while (0);
 
     /* clean up on failure */
+#if USE_CY_MEMTRACK
+    CY_MEMTRACK_FREE(wrapper_ptr);
+#else
     free(wrapper_ptr);
+#endif
 
     return CY_RTOS_NO_MEMORY;
 
@@ -805,7 +910,12 @@ cy_rslt_t cy_rtos_deinit_mutex(cy_mutex_t * mutex)
         status = cy_rtos_deinit_semaphore(&(wrapper_ptr->sem_impl));
     }
 
+#if USE_CY_MEMTRACK
+    CY_MEMTRACK_FREE(wrapper_ptr);
+#else
     free(wrapper_ptr);
+#endif
+
     return status;
 
 #elif (IMPLEMENT_CY_MUTEX_USING_RT_SEMAPHORE_RECURSIVE)
@@ -826,7 +936,12 @@ cy_rslt_t cy_rtos_deinit_mutex(cy_mutex_t * mutex)
         rt_exit_critical();
     }
 
+#if USE_CY_MEMTRACK
+    CY_MEMTRACK_FREE(wrapper_ptr);
+#else
     free(wrapper_ptr);
+#endif
+
     return status;
 
 #else
@@ -840,13 +955,11 @@ cy_rslt_t cy_rtos_deinit_mutex(cy_mutex_t * mutex)
 ******************************************************/
 
 #define SEMAPHORE_NAME_PREFIX_CHAR  's'
-#define SEMAPHORE_NAME_MAX_LEN      10  /* e.g. "sDEADBEEF" with null terminator */
 
 typedef struct {
     rt_sem_t sem;
     uint32_t magic;
     uint32_t maxcount;
-    char *name_p;
 } cy_semaphore_wrapper_t;
 
 cy_rslt_t cy_rtos_init_semaphore(cy_semaphore_t * semaphore,
@@ -858,24 +971,33 @@ cy_rslt_t cy_rtos_init_semaphore(cy_semaphore_t * semaphore,
     RT_ReturnAssert(semaphore != NULL, CY_RTOS_BAD_PARAM);
 
     /* RT-Thread semaphore only accepts 1 value parameter, which we expect is a 'initcount' */
-    /* Also, we expect initcount to be zero or less than smaxcount */
+    /* Also, we expect initcount to be zero or less than maxcount */
     RT_ReturnAssert(maxcount > 0, CY_RTOS_BAD_PARAM);
     RT_ReturnAssert((maxcount >= initcount), CY_RTOS_BAD_PARAM);
 
     do {
+        static uint16_t counter = 0;
+        char name[RT_NAME_MAX];
+
+#if USE_CY_MEMTRACK
+        wrapper_ptr =
+            (cy_semaphore_wrapper_t *) CY_MEMTRACK_MALLOC(sizeof(cy_semaphore_wrapper_t));
+#else
         wrapper_ptr =
             (cy_semaphore_wrapper_t *) malloc(sizeof(cy_semaphore_wrapper_t));
+#endif
+
         RT_ReturnAssert(wrapper_ptr != NULL, CY_RTOS_NO_MEMORY);
 
         wrapper_ptr->magic = SEMAPHORE_IDENT;
         wrapper_ptr->maxcount = maxcount;
-        wrapper_ptr->name_p = make_name_field(SEMAPHORE_NAME_MAX_LEN,
-                                              SEMAPHORE_NAME_PREFIX_CHAR);
-        if (wrapper_ptr->name_p == NULL) {
-            break;
-        }
 
-        wrapper_ptr->sem = rt_sem_create(wrapper_ptr->name_p,
+        make_name_field(name,
+                        sizeof(name),
+                        SEMAPHORE_NAME_PREFIX_CHAR,
+                        &counter);
+
+        wrapper_ptr->sem = rt_sem_create(name,
                                          initcount,
                                          RT_IPC_FLAG_FIFO);
         if (wrapper_ptr->sem == NULL) {
@@ -888,10 +1010,11 @@ cy_rslt_t cy_rtos_init_semaphore(cy_semaphore_t * semaphore,
     } while (0);
 
     /* clean up on failure */
-    if (wrapper_ptr != NULL) {
-        free(wrapper_ptr->name_p);
-    }
+#if USE_CY_MEMTRACK
+    CY_MEMTRACK_FREE(wrapper_ptr);
+#else
     free(wrapper_ptr);
+#endif
 
     return CY_RTOS_NO_MEMORY;
 }
@@ -917,6 +1040,8 @@ cy_rslt_t cy_rtos_get_semaphore(cy_semaphore_t * semaphore,
         result = rt_sem_take(wrapper_ptr->sem, ticks);
     }
 
+    s_last_error = result;
+
     return (result == RT_EOK)
         ? CY_RSLT_SUCCESS : CY_RTOS_TIMEOUT;
 }
@@ -941,14 +1066,13 @@ cy_rslt_t cy_rtos_set_semaphore(cy_semaphore_t * semaphore,
     else {
         RT_ReturnAssert(((wrapper_ptr->sem)->value == wrapper_ptr->maxcount),
                         CY_RTOS_GENERAL_ERROR);
-
-        result = RT_EOK;
+        result = -RT_ERROR; //RT_EOK;
     }
 
-    RT_ReturnAssert((result == RT_EOK), CY_RTOS_GENERAL_ERROR);
+    s_last_error = result;
 
     return (result == RT_EOK)
-        ? CY_RSLT_SUCCESS : CY_RTOS_TIMEOUT;
+        ? CY_RSLT_SUCCESS : CY_RTOS_GENERAL_ERROR; //CY_RTOS_TIMEOUT;
 }
 
 cy_rslt_t cy_rtos_get_count_semaphore(cy_semaphore_t * semaphore,
@@ -982,9 +1106,13 @@ cy_rslt_t cy_rtos_deinit_semaphore(cy_semaphore_t * semaphore)
     rt_enter_critical();
 
     result = rt_sem_delete(wrapper_ptr->sem);
+    s_last_error = result;
 
-    free(wrapper_ptr->name_p);
+#if USE_CY_MEMTRACK
+    CY_MEMTRACK_FREE(wrapper_ptr);
+#else
     free(wrapper_ptr);
+#endif
 
     rt_exit_critical();
 
@@ -1000,12 +1128,11 @@ cy_rslt_t cy_rtos_deinit_semaphore(cy_semaphore_t * semaphore)
 ******************************************************/
 
 #define EVENT_NAME_PREFIX_CHAR  'e'
-#define EVENT_NAME_MAX_LEN      10      /* e.g. "eDEADBEEF" with null terminator */
+#define EVENT_USABLE_BITS       0x00FFFFFF  // to be consistent with FreeRTOS implementation
 
 typedef struct {
     rt_event_t event;
     uint32_t magic;
-    char *name_p;
 } cy_event_wrapper_t;
 
 
@@ -1016,17 +1143,26 @@ cy_rslt_t cy_rtos_init_event(cy_event_t * event)
     RT_ReturnAssert(event != NULL, CY_RTOS_BAD_PARAM);
 
     do {
+        static uint16_t counter = 0;
+        char name[RT_NAME_MAX];
+
+#if USE_CY_MEMTRACK
+        wrapper_ptr = (cy_event_wrapper_t *) CY_MEMTRACK_MALLOC(sizeof(cy_event_wrapper_t));
+#else
         wrapper_ptr = (cy_event_wrapper_t *) malloc(sizeof(cy_event_wrapper_t));
+#endif
+
         RT_ReturnAssert(wrapper_ptr != NULL, CY_RTOS_NO_MEMORY);
 
         wrapper_ptr->magic = EVENT_IDENT;
-        wrapper_ptr->name_p = make_name_field(EVENT_NAME_MAX_LEN,
-                                              EVENT_NAME_PREFIX_CHAR);
-        if (wrapper_ptr->name_p == NULL) {
-            break;
-        }
 
-        wrapper_ptr->event = rt_event_create(wrapper_ptr->name_p, RT_IPC_FLAG_FIFO);
+        make_name_field(name,
+                        sizeof(name),
+                        EVENT_NAME_PREFIX_CHAR,
+                        &counter);
+
+        wrapper_ptr->event = rt_event_create(name,
+                                             RT_IPC_FLAG_FIFO);
         if (wrapper_ptr->event == NULL) {
             break;
         }
@@ -1037,10 +1173,11 @@ cy_rslt_t cy_rtos_init_event(cy_event_t * event)
     } while (0);
 
     /* clean up on failure */
-    if (wrapper_ptr != NULL) {
-        free(wrapper_ptr->name_p);
-    }
+#if USE_CY_MEMTRACK
+    CY_MEMTRACK_FREE(wrapper_ptr);
+#else
     free(wrapper_ptr);
+#endif
 
     return CY_RTOS_NO_MEMORY;
 }
@@ -1053,6 +1190,7 @@ cy_rslt_t cy_rtos_setbits_event(cy_event_t * event,
     rt_err_t result;
 
     RT_ReturnAssert(event != NULL, CY_RTOS_BAD_PARAM);
+    RT_ReturnAssert((bits & (~EVENT_USABLE_BITS)) == 0, CY_RTOS_BAD_PARAM);
 
     wrapper_ptr = (cy_event_wrapper_t *) (*event);
     RT_ReturnAssert(wrapper_ptr != NULL, CY_RTOS_BAD_PARAM);
@@ -1061,6 +1199,7 @@ cy_rslt_t cy_rtos_setbits_event(cy_event_t * event,
     (void) in_isr;              // Unused parameter in this implementation
 
     result = rt_event_send(wrapper_ptr->event, bits);
+    s_last_error = result;
 
     return (result == RT_EOK)
         ? CY_RSLT_SUCCESS : CY_RTOS_GENERAL_ERROR;
@@ -1073,6 +1212,7 @@ cy_rslt_t cy_rtos_clearbits_event(cy_event_t * event,
     cy_event_wrapper_t *wrapper_ptr = NULL;
 
     RT_ReturnAssert(event != NULL, CY_RTOS_BAD_PARAM);
+    RT_ReturnAssert((bits & (~EVENT_USABLE_BITS)) == 0, CY_RTOS_BAD_PARAM);
 
     wrapper_ptr = (cy_event_wrapper_t *) (*event);
     RT_ReturnAssert(wrapper_ptr != NULL, CY_RTOS_BAD_PARAM);
@@ -1080,9 +1220,14 @@ cy_rslt_t cy_rtos_clearbits_event(cy_event_t * event,
 
     (void) in_isr;              // Unused parameter in this implementation
 
+    // trying to clear bits when already 'clean', should produce an error
+    if ((wrapper_ptr->event)->set == 0) {
+        return CY_RTOS_GENERAL_ERROR;
+    }
+
     rt_enter_critical();
 
-    (wrapper_ptr->event)->set &= ~bits;
+    (wrapper_ptr->event)->set &= ~bits; // clear it here
 
     rt_exit_critical();
 
@@ -1121,9 +1266,13 @@ cy_rslt_t cy_rtos_waitbits_event(cy_event_t * event,
     rt_uint8_t option;
     rt_uint32_t set;
     cy_time_t ticks;
+    rt_uint32_t recved = 0;
+    rt_uint32_t setbits;
 
     RT_ReturnAssert(event != NULL, CY_RTOS_BAD_PARAM);
     RT_ReturnAssert(waitfor != NULL, CY_RTOS_BAD_PARAM);
+    RT_ReturnAssert(*waitfor != 0, CY_RTOS_BAD_PARAM);
+    RT_ReturnAssert((*waitfor & (~EVENT_USABLE_BITS)) == 0, CY_RTOS_BAD_PARAM);
 
     wrapper_ptr = (cy_event_wrapper_t *) (*event);
     RT_ReturnAssert(wrapper_ptr != NULL, CY_RTOS_BAD_PARAM);
@@ -1132,13 +1281,30 @@ cy_rslt_t cy_rtos_waitbits_event(cy_event_t * event,
     set = *waitfor;
     option = allset ? RT_EVENT_FLAG_AND : RT_EVENT_FLAG_OR;
 
+    /* Not using this flag because it does not give us a chance to
+     * save the event before it gets 'cleared'
     if (clear) {
         option |= RT_EVENT_FLAG_CLEAR;
     }
+    */
 
     ticks = convert_ms_to_ticks(timeout_ms);
+    result = rt_event_recv(wrapper_ptr->event, set, option, ticks, &recved);
 
-    result = rt_event_recv(wrapper_ptr->event, set, option, ticks, NULL);
+    rt_enter_critical();
+
+    setbits = (wrapper_ptr->event)->set;     // save the triggered event before clearing
+    if ((result == RT_EOK) && clear) {
+        (wrapper_ptr->event)->set &= (~set); // clear it here
+    }
+
+    rt_exit_critical();
+
+    s_last_error = result;
+
+    if ((result == RT_EOK) || (result == -RT_ETIMEOUT)) {
+        *waitfor = setbits;
+    }
 
     return (result == RT_EOK)
         ? CY_RSLT_SUCCESS : CY_RTOS_TIMEOUT;
@@ -1158,9 +1324,13 @@ cy_rslt_t cy_rtos_deinit_event(cy_event_t * event)
     rt_enter_critical();
 
     result = rt_event_delete(wrapper_ptr->event);
+    s_last_error = result;
 
-    free(wrapper_ptr->name_p);
+#if USE_CY_MEMTRACK
+    CY_MEMTRACK_FREE(wrapper_ptr);
+#else
     free(wrapper_ptr);
+#endif
 
     rt_exit_critical();
 
@@ -1174,12 +1344,10 @@ cy_rslt_t cy_rtos_deinit_event(cy_event_t * event)
 ******************************************************/
 
 #define QUEUE_NAME_PREFIX_CHAR  'q'
-#define QUEUE_NAME_MAX_LEN      10      /* e.g. "qDEADBEEF" with null terminator */
 
 typedef struct {
     rt_mq_t queue;
     uint32_t magic;
-    char *name_p;
 } cy_queue_wrapper_t;
 
 
@@ -1192,18 +1360,28 @@ cy_rslt_t cy_rtos_init_queue(cy_queue_t * queue,
     RT_ReturnAssert(queue != NULL, CY_RTOS_BAD_PARAM);
 
     do {
+        static uint16_t counter = 0;
+        char name[RT_NAME_MAX];
+
+#if USE_CY_MEMTRACK
+        wrapper_ptr = (cy_queue_wrapper_t *) CY_MEMTRACK_MALLOC(sizeof(cy_queue_wrapper_t));
+#else
         wrapper_ptr = (cy_queue_wrapper_t *) malloc(sizeof(cy_queue_wrapper_t));
+#endif
+
         RT_ReturnAssert(wrapper_ptr != NULL, CY_RTOS_NO_MEMORY);
 
         wrapper_ptr->magic = QUEUE_IDENT;
-        wrapper_ptr->name_p = make_name_field(QUEUE_NAME_MAX_LEN,
-                                              QUEUE_NAME_PREFIX_CHAR);
-        if (wrapper_ptr->name_p == NULL) {
-            break;
-        }
 
-        wrapper_ptr->queue = rt_mq_create(wrapper_ptr->name_p,
-                                          itemsize, length, RT_IPC_FLAG_FIFO);
+        make_name_field(name,
+                        sizeof(name),
+                        QUEUE_NAME_PREFIX_CHAR,
+                        &counter);
+
+        wrapper_ptr->queue = rt_mq_create(name,
+                                          itemsize,
+                                          length,
+                                          RT_IPC_FLAG_FIFO);
         if (wrapper_ptr->queue == NULL) {
             break;
         }
@@ -1214,10 +1392,11 @@ cy_rslt_t cy_rtos_init_queue(cy_queue_t * queue,
     } while (0);
 
     /* clean up on failure */
-    if (wrapper_ptr != NULL) {
-        free(wrapper_ptr->name_p);
-    }
+#if USE_CY_MEMTRACK
+    CY_MEMTRACK_FREE(wrapper_ptr);
+#else
     free(wrapper_ptr);
+#endif
 
     return CY_RTOS_NO_MEMORY;
 }
@@ -1247,10 +1426,10 @@ cy_rslt_t cy_rtos_put_queue(cy_queue_t * queue,
                                  item_ptr, (wrapper_ptr->queue)->msg_size, ticks);
     }
 
-    RT_ReturnAssert((result == RT_EOK), CY_RTOS_GENERAL_ERROR);
+    s_last_error = result;
 
     return (result == RT_EOK)
-        ? CY_RSLT_SUCCESS : CY_RTOS_TIMEOUT;
+        ? CY_RSLT_SUCCESS : CY_RTOS_GENERAL_ERROR;
 }
 
 cy_rslt_t cy_rtos_get_queue(cy_queue_t * queue,
@@ -1274,10 +1453,10 @@ cy_rslt_t cy_rtos_get_queue(cy_queue_t * queue,
     result = rt_mq_recv(wrapper_ptr->queue,
                         item_ptr, (wrapper_ptr->queue)->msg_size, ticks);
 
-    RT_ReturnAssert((result == RT_EOK), CY_RTOS_GENERAL_ERROR);
+    s_last_error = result;
 
     return (result == RT_EOK)
-        ? CY_RSLT_SUCCESS : CY_RTOS_TIMEOUT;
+        ? CY_RSLT_SUCCESS : CY_RTOS_GENERAL_ERROR;
 }
 
 cy_rslt_t cy_rtos_count_queue(cy_queue_t * queue,
@@ -1335,6 +1514,7 @@ cy_rslt_t cy_rtos_reset_queue(cy_queue_t * queue)
 
     result = rt_mq_control(wrapper_ptr->queue, RT_IPC_CMD_RESET, NULL);
 
+    s_last_error = result;
     RT_ReturnAssert((result == RT_EOK), CY_RTOS_GENERAL_ERROR);
 
     return (result == RT_EOK)
@@ -1355,9 +1535,13 @@ cy_rslt_t cy_rtos_deinit_queue(cy_queue_t * queue)
     rt_enter_critical();
 
     result = rt_mq_delete(wrapper_ptr->queue);
+    s_last_error = result;
 
-    free(wrapper_ptr->name_p);
+#if USE_CY_MEMTRACK
+    CY_MEMTRACK_FREE(wrapper_ptr);
+#else
     free(wrapper_ptr);
+#endif
 
     rt_exit_critical();
 
@@ -1373,12 +1557,10 @@ cy_rslt_t cy_rtos_deinit_queue(cy_queue_t * queue)
 ******************************************************/
 
 #define TIMER_NAME_PREFIX_CHAR  't'
-#define TIMER_NAME_MAX_LEN      10      /* e.g. "tDEADBEEF" with null terminator */
 
 typedef struct {
     rt_timer_t timer;
     uint32_t magic;
-    char *name_p;
 } cy_timer_wrapper_t;
 
 cy_rslt_t cy_rtos_init_timer(cy_timer_t * timer,
@@ -1392,20 +1574,32 @@ cy_rslt_t cy_rtos_init_timer(cy_timer_t * timer,
     RT_ReturnAssert(timer != NULL, CY_RTOS_BAD_PARAM);
 
     do {
+        static uint16_t counter = 0;
+        char name[RT_NAME_MAX];
+
+#if USE_CY_MEMTRACK
+        wrapper_ptr = (cy_timer_wrapper_t *) CY_MEMTRACK_MALLOC(sizeof(cy_timer_wrapper_t));
+#else
         wrapper_ptr = (cy_timer_wrapper_t *) malloc(sizeof(cy_timer_wrapper_t));
+#endif
+
         RT_ReturnAssert(wrapper_ptr != NULL, CY_RTOS_NO_MEMORY);
 
         wrapper_ptr->magic = TIMER_IDENT;
-        wrapper_ptr->name_p = make_name_field(TIMER_NAME_MAX_LEN,
-                                              TIMER_NAME_PREFIX_CHAR);
-        if (wrapper_ptr->name_p == NULL) {
-            break;
-        }
 
         flag = (type == CY_TIMER_TYPE_PERIODIC)
             ? RT_TIMER_FLAG_PERIODIC : RT_TIMER_FLAG_ONE_SHOT;
 
-        wrapper_ptr->timer = rt_timer_create(wrapper_ptr->name_p, fun, arg, 1, flag);
+        make_name_field(name,
+                        sizeof(name),
+                        TIMER_NAME_PREFIX_CHAR,
+                        &counter);
+
+        wrapper_ptr->timer = rt_timer_create(name,
+                                             fun,
+                                             arg,
+                                             1,
+                                             flag);
         if (wrapper_ptr->timer == NULL) {
             break;
         }
@@ -1416,10 +1610,11 @@ cy_rslt_t cy_rtos_init_timer(cy_timer_t * timer,
     } while (0);
 
     /* clean up on failure */
-    if (wrapper_ptr != NULL) {
-        free(wrapper_ptr->name_p);
-    }
+#if USE_CY_MEMTRACK
+    CY_MEMTRACK_FREE(wrapper_ptr);
+#else
     free(wrapper_ptr);
+#endif
 
     return CY_RTOS_NO_MEMORY;
 }
@@ -1444,6 +1639,7 @@ cy_rslt_t cy_rtos_start_timer(cy_timer_t * timer,
     if (result == RT_EOK) {
         result = rt_timer_start(wrapper_ptr->timer);
     }
+    s_last_error = result;
 
     return (result == RT_EOK)
         ? CY_RSLT_SUCCESS : CY_RTOS_GENERAL_ERROR;
@@ -1461,6 +1657,13 @@ cy_rslt_t cy_rtos_stop_timer(cy_timer_t * timer)
     RT_ReturnAssert(wrapper_ptr->magic == TIMER_IDENT, CY_RTOS_BAD_PARAM);
 
     result = rt_timer_stop(wrapper_ptr->timer);
+    s_last_error = result;
+
+    if ((result == -RT_ERROR) &&
+        !(wrapper_ptr->timer->parent.flag & RT_TIMER_FLAG_ACTIVATED)) {
+        // timer already stopped
+        return CY_RSLT_SUCCESS;
+    }
 
     return (result == RT_EOK)
         ? CY_RSLT_SUCCESS : CY_RTOS_GENERAL_ERROR;
@@ -1482,6 +1685,7 @@ cy_rslt_t cy_rtos_is_running_timer(cy_timer_t * timer,
 
     result = rt_timer_control(wrapper_ptr->timer,
                               RT_TIMER_CTRL_GET_STATE, &state_flag);
+    s_last_error = result;
 
     if (result == RT_EOK) {
         *state = (state_flag == RT_TIMER_FLAG_ACTIVATED)
@@ -1506,9 +1710,13 @@ cy_rslt_t cy_rtos_deinit_timer(cy_timer_t * timer)
     rt_enter_critical();
 
     result = rt_timer_delete(wrapper_ptr->timer);
+    s_last_error = result;
 
-    free(wrapper_ptr->name_p);
+#if USE_CY_MEMTRACK
+    CY_MEMTRACK_FREE(wrapper_ptr);
+#else
     free(wrapper_ptr);
+#endif
 
     rt_exit_critical();
 
