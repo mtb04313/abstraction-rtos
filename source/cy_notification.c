@@ -39,6 +39,7 @@
 * so agrees to indemnify Cypress against all liability.
 *******************************************************************************/
 
+#include <string.h>
 #include "cy_notification.h"
 
 
